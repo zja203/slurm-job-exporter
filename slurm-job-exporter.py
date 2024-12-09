@@ -110,7 +110,7 @@ class SlurmJobCollector(object):
     running slurm jobs on a node. This is using the stats from the cgroups
     created by Slurm.
     """
-    def __init__(self, dcgm_update_interval=10):
+    def __init__(self, disable_gpus, dcgm_update_interval=10):
         """
         Args:
             dcgm_update_interval (int, optional): Pooling interval in seconds used by DCGM. Defaults to 10.
@@ -119,80 +119,84 @@ class SlurmJobCollector(object):
         self.MONITOR_DCGM = False
         self.MONITOR_PYNVML = False
         self.UNSUPPORTED_FEATURES = []
-        for proc in psutil.process_iter():
-            if proc.name() == 'nv-hostengine':
-                # DCGM is running on this host
-                # Load DCGM bindings from the RPM
-                sys.path.insert(0, '/usr/local/dcgm/bindings/python3/')
+        if self.disable_gpus == False:
+            # Try and find DCGM
+            for proc in psutil.process_iter():
+                if proc.name() == 'nv-hostengine':
+                    # DCGM is running on this host
+                    # Load DCGM bindings from the RPM
+                    sys.path.insert(0, '/usr/local/dcgm/bindings/python3/')
 
+                    try:
+                        import pydcgm
+                        import dcgm_fields
+                        import dcgm_structs
+
+                        self.handle = pydcgm.DcgmHandle(None, 'localhost')
+                        self.group = pydcgm.DcgmGroup(self.handle, groupName="slurm-job-exporter", groupType=dcgm_structs.DCGM_GROUP_DEFAULT_INSTANCES)
+
+                        if len(self.group.GetEntities()) == 0:
+                            # No MIG, switch to default group
+                            self.group.Delete()
+                            self.group = pydcgm.DcgmGroup(self.handle, groupName="slurm-job-exporter", groupType=dcgm_structs.DCGM_GROUP_DEFAULT)
+
+                        # https://github.com/NVIDIA/gpu-monitoring-tools/blob/master/bindings/go/dcgm/dcgm_fields.h
+                        self.fieldIds_dict = {
+                            dcgm_fields.DCGM_FI_DEV_NAME: 'name',
+                            dcgm_fields.DCGM_FI_DEV_UUID: 'uuid',
+                            dcgm_fields.DCGM_FI_DEV_CUDA_VISIBLE_DEVICES_STR: 'cuda_visible_devices_str',
+                            dcgm_fields.DCGM_FI_DEV_POWER_USAGE: 'power_usage',
+                            dcgm_fields.DCGM_FI_DEV_FB_USED: 'fb_used',
+                            dcgm_fields.DCGM_FI_PROF_PIPE_FP64_ACTIVE: 'fp64_active',
+                            dcgm_fields.DCGM_FI_PROF_PIPE_FP32_ACTIVE: 'fp32_active',
+                            dcgm_fields.DCGM_FI_PROF_PIPE_FP16_ACTIVE: 'fp16_active',
+                            dcgm_fields.DCGM_FI_PROF_SM_ACTIVE: 'sm_active',
+                            dcgm_fields.DCGM_FI_PROF_SM_OCCUPANCY: 'sm_occupancy',
+                            dcgm_fields.DCGM_FI_PROF_PIPE_TENSOR_ACTIVE: 'tensor_active',
+                            dcgm_fields.DCGM_FI_PROF_DRAM_ACTIVE: 'dram_active',
+                            dcgm_fields.DCGM_FI_PROF_PCIE_TX_BYTES: 'pcie_tx_bytes',
+                            dcgm_fields.DCGM_FI_PROF_PCIE_RX_BYTES: 'pcie_rx_bytes',
+                            dcgm_fields.DCGM_FI_PROF_NVLINK_TX_BYTES: 'nvlink_tx_bytes',
+                            dcgm_fields.DCGM_FI_PROF_NVLINK_RX_BYTES: 'nvlink_rx_bytes',
+                        }
+
+                        for gpu_id in pydcgm.DcgmSystemDiscovery(self.handle).GetAllSupportedGpuIds():
+                            device = pydcgm.dcgm_agent.dcgmGetDeviceAttributes(self.handle.handle, gpu_id)
+                            name = device.identifiers.deviceName
+                            print('Detected gpu {} with ID {}'.format(name, gpu_id))
+                            if name in ['NVIDIA RTX A6000', 'NVIDIA L4', 'NVIDIA L40S', 'NVIDIA L40']:
+                                # This GPU does not supports fp64, we don't support a mix of fp64 and non-fp64 GPUs in the same node
+                                print('Removing fp64 metrics since {} does not support fp64'.format(name))
+                                del self.fieldIds_dict[dcgm_fields.DCGM_FI_PROF_PIPE_FP64_ACTIVE]
+                                self.UNSUPPORTED_FEATURES.append('fp64')
+                                break
+
+                        self.field_group = pydcgm.DcgmFieldGroup(self.handle, name="slurm-job-exporter-fg", fieldIds=list(self.fieldIds_dict.keys()))
+                        self.group.samples.WatchFields(self.field_group, dcgm_update_interval * 1000 * 1000, dcgm_update_interval * 2.0, 0)
+                        self.handle.GetSystem().UpdateAllFields(True)
+
+                        print('Monitoring GPUs with DCGM with an update interval of {} seconds'.format(dcgm_update_interval))
+                        self.MONITOR_DCGM = True
+                        self.MONITOR_PYNVML = False
+                    except ImportError:
+                        self.MONITOR_DCGM = False
+
+            # using nvml as a fallback for DCGM
+            if self.MONITOR_DCGM is False:
                 try:
-                    import pydcgm
-                    import dcgm_fields
-                    import dcgm_structs
-
-                    self.handle = pydcgm.DcgmHandle(None, 'localhost')
-                    self.group = pydcgm.DcgmGroup(self.handle, groupName="slurm-job-exporter", groupType=dcgm_structs.DCGM_GROUP_DEFAULT_INSTANCES)
-
-                    if len(self.group.GetEntities()) == 0:
-                        # No MIG, switch to default group
-                        self.group.Delete()
-                        self.group = pydcgm.DcgmGroup(self.handle, groupName="slurm-job-exporter", groupType=dcgm_structs.DCGM_GROUP_DEFAULT)
-
-                    # https://github.com/NVIDIA/gpu-monitoring-tools/blob/master/bindings/go/dcgm/dcgm_fields.h
-                    self.fieldIds_dict = {
-                        dcgm_fields.DCGM_FI_DEV_NAME: 'name',
-                        dcgm_fields.DCGM_FI_DEV_UUID: 'uuid',
-                        dcgm_fields.DCGM_FI_DEV_CUDA_VISIBLE_DEVICES_STR: 'cuda_visible_devices_str',
-                        dcgm_fields.DCGM_FI_DEV_POWER_USAGE: 'power_usage',
-                        dcgm_fields.DCGM_FI_DEV_FB_USED: 'fb_used',
-                        dcgm_fields.DCGM_FI_PROF_PIPE_FP64_ACTIVE: 'fp64_active',
-                        dcgm_fields.DCGM_FI_PROF_PIPE_FP32_ACTIVE: 'fp32_active',
-                        dcgm_fields.DCGM_FI_PROF_PIPE_FP16_ACTIVE: 'fp16_active',
-                        dcgm_fields.DCGM_FI_PROF_SM_ACTIVE: 'sm_active',
-                        dcgm_fields.DCGM_FI_PROF_SM_OCCUPANCY: 'sm_occupancy',
-                        dcgm_fields.DCGM_FI_PROF_PIPE_TENSOR_ACTIVE: 'tensor_active',
-                        dcgm_fields.DCGM_FI_PROF_DRAM_ACTIVE: 'dram_active',
-                        dcgm_fields.DCGM_FI_PROF_PCIE_TX_BYTES: 'pcie_tx_bytes',
-                        dcgm_fields.DCGM_FI_PROF_PCIE_RX_BYTES: 'pcie_rx_bytes',
-                        dcgm_fields.DCGM_FI_PROF_NVLINK_TX_BYTES: 'nvlink_tx_bytes',
-                        dcgm_fields.DCGM_FI_PROF_NVLINK_RX_BYTES: 'nvlink_rx_bytes',
-                    }
-
-                    for gpu_id in pydcgm.DcgmSystemDiscovery(self.handle).GetAllSupportedGpuIds():
-                        device = pydcgm.dcgm_agent.dcgmGetDeviceAttributes(self.handle.handle, gpu_id)
-                        name = device.identifiers.deviceName
-                        print('Detected gpu {} with ID {}'.format(name, gpu_id))
-                        if name in ['NVIDIA RTX A6000', 'NVIDIA L4', 'NVIDIA L40S']:
-                            # This GPU does not supports fp64, we don't support a mix of fp64 and non-fp64 GPUs in the same node
-                            print('Removing fp64 metrics since {} does not support fp64'.format(name))
-                            del self.fieldIds_dict[dcgm_fields.DCGM_FI_PROF_PIPE_FP64_ACTIVE]
-                            self.UNSUPPORTED_FEATURES.append('fp64')
-                            break
-
-                    self.field_group = pydcgm.DcgmFieldGroup(self.handle, name="slurm-job-exporter-fg", fieldIds=list(self.fieldIds_dict.keys()))
-                    self.group.samples.WatchFields(self.field_group, dcgm_update_interval * 1000 * 1000, dcgm_update_interval * 2.0, 0)
-                    self.handle.GetSystem().UpdateAllFields(True)
-
-                    print('Monitoring GPUs with DCGM with an update interval of {} seconds'.format(dcgm_update_interval))
-                    self.MONITOR_DCGM = True
-                    self.MONITOR_PYNVML = False
+                    import pynvml
+                    pynvml.nvmlInit()
+                    self.MONITOR_PYNVML = True
+                    print('Monitoring GPUs with pynvml')
+                    self.pynvml = pynvml
                 except ImportError:
-                    self.MONITOR_DCGM = False
-
-        # using nvml as a fallback for DCGM
-        if self.MONITOR_DCGM is False:
-            try:
-                import pynvml
-                pynvml.nvmlInit()
-                self.MONITOR_PYNVML = True
-                print('Monitoring GPUs with pynvml')
-                self.pynvml = pynvml
-            except ImportError:
-                self.MONITOR_PYNVML = False
-            except pynvml.NVMLError_LibraryNotFound:
-                self.MONITOR_PYNVML = False
-            except pynvml.NVMLError_DriverNotLoaded:
-                self.MONITOR_PYNVML = False
+                    self.MONITOR_PYNVML = False
+                except pynvml.NVMLError_LibraryNotFound:
+                    self.MONITOR_PYNVML = False
+                except pynvml.NVMLError_DriverNotLoaded:
+                    self.MONITOR_PYNVML = False
+        else:
+            print('GPU monitoring not requested.')
 
     def GetLatestGpuValuesAsDict(self):
         gpus = {}
@@ -639,9 +643,13 @@ within a cgroup')
         type=int,
         default=10,
         help='DCGM update interval in seconds, default is 10')
+    PARSER.add_argument(
+            '--no-gpu',
+            action='store_true',
+            help='Disable gpu metrics')
     ARGS = PARSER.parse_args()
 
-    APP = make_wsgi_app(SlurmJobCollector(dcgm_update_interval=ARGS.dcgm_update_interval))
+    APP = make_wsgi_app(SlurmJobCollector(disable_gpus=ARGS.no_gpu, dcgm_update_interval=ARGS.dcgm_update_interval))
     HTTPD = make_server('', ARGS.port, APP,
                         handler_class=NoLoggingWSGIRequestHandler)
     HTTPD.serve_forever()
