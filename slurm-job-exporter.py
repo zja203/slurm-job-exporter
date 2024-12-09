@@ -9,6 +9,7 @@ from functools import lru_cache
 from wsgiref.simple_server import make_server, WSGIRequestHandler
 from prometheus_client.core import GaugeMetricFamily, CounterMetricFamily
 from prometheus_client import make_wsgi_app
+import platform
 
 
 GPU_UUID_RE = re.compile('(GPU|MIG)-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})')
@@ -317,10 +318,28 @@ per elapsed cycle)',
         else:
             cgroups = 2  # we are running cgroups v2
 
+        nodename = platform.node().split('.')[0]
+
+        # If Slurm was compiled with the option --enable-multiple-slurmd
+        # cgroup paths will be different
+        # https://slurm.schedmd.com/cgroup_v2.html#slurmd_startup
+        multiple_slurmd = False
+        if cgroups == 1 and os.path.exists(f"/sys/fs/group/memory/slurm_{nodename}"):
+            multiple_slurmd = True
+        elif os.path.exists(f"/sys/fs/cgroup/system.slice/{nodename}_slurmstepd.scope/"):
+            multiple_slurmd = True
+
+
         if cgroups == 1:
-            jobs_glob = "/sys/fs/cgroup/memory/slurm/uid_*/job_*"
+            if multiple_slurmd:
+                jobs_glob = f"/sys/fs/cgroup/memory/slurm_{nodename}" + "/uid_*/job_*"
+            else:
+                jobs_glob = f"/sys/fs/cgroup/memory/slurm" + "/uid_*/job_*"
         else:
-            jobs_glob = "/sys/fs/cgroup/system.slice/slurmstepd.scope/job_*"
+            if multiple_slurmd:
+                jobs_glob = f"/sys/fs/cgroup/system.slice/{nodename}_slurmstepd.scope/" + "job_*"
+            else:
+                jobs_glob = f"/sys/fs/cgroup/system.slice/slurmstepd.scope/" + "job_*"
         for job_dir in glob.glob(jobs_glob):
             job = job_dir.split('/')[-1].split('_')[1]
             uid, procs = cgroup_processes(job_dir)
@@ -332,7 +351,10 @@ per elapsed cycle)',
             gpu_set = set()
             if self.MONITOR_PYNVML or self.MONITOR_DCGM:
                 if cgroups == 1:
-                    gpu_dir = "/sys/fs/cgroup/devices/slurm/uid_{}/job_{}".format(uid, job)
+                    if multiple_slurmd:
+                        gpu_dir = f"/sys/fs/cgroup/devices/slurm_{nodename}" + "/uid_{}/job_{}".format(uid, job)
+                    else:
+                        gpu_dir = f"/sys/fs/cgroup/devices/slurm" + "/uid_{}/job_{}".format(uid, job)
                 else:
                     gpu_dir = job_dir
                 gpu_set.update(cgroup_gpus(gpu_dir, cgroups))
@@ -400,7 +422,10 @@ per elapsed cycle)',
 
             # get the allocated cores
             if cgroups == 1:
-                cpuset_path = '/sys/fs/cgroup/cpuset/slurm/uid_{}/job_{}/cpuset.effective_cpus'.format(uid, job)
+                if multiple_slurmd:
+                    cpuset_path = f'/sys/fs/cgroup/cpuset/slurm_{nodename}/uid_{uid}/job_{job}/cpuset.effective_cpus'
+                else:
+                    cpuset_path = f'/sys/fs/cgroup/cpuset/slurm/uid_{uid}/job_{job}/cpuset.effective_cpus'
             else:
                 cpuset_path = os.path.join(job_dir, 'cpuset.cpus.effective')
 
@@ -409,7 +434,11 @@ per elapsed cycle)',
 
             if cgroups == 1:
                 # There is no equivalent to this in cgroups v2
-                with open('/sys/fs/cgroup/cpu,cpuacct/slurm/uid_{}/job_{}/cpuacct.usage_percpu'.format(uid, job), 'r') as f_usage:
+                if multiple_slurmd:
+                    cpupacct_path = f"/sys/fs/cgroup/cpu,cpuacct/slurm_{nodename}/uid_{uid}/job_{job}/cpuacct.usage_percpu"
+                else:
+                    cpupacct_path = f"/sys/fs/cgroup/cpu,cpuacct/slurm/uid_{uid}/job_{job}/cpuacct.usage_percpu"
+                with open(cpupacct_path, 'r') as f_usage:
                     cpu_usages = f_usage.read().split()
                     for core in cores:
                         counter_core_usage.add_metric([user, account, job, str(core)],
