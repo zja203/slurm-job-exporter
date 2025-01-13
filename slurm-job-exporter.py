@@ -119,6 +119,7 @@ class SlurmJobCollector(object):
         self.MONITOR_DCGM = False
         self.MONITOR_PYNVML = False
         self.UNSUPPORTED_FEATURES = []
+        self.disable_gpus = disable_gpus
         if self.disable_gpus == False:
             # Try and find DCGM
             for proc in psutil.process_iter():
