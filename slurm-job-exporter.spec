@@ -11,7 +11,8 @@ URL:      https://github.com/BCH-High-Performance-Computing/%{name}
 Source0:  https://github.com/BCH-High-Performance-Computing/%{name}/archive/%{ref}/%{name}-%{ref}.tar.gz
 
 BuildArch:      noarch
-BuildRequires:	systemd
+BuildRequires:  systemd-rpm-macros
+Requires:       systemd
 Requires:       python3
 Requires:       python3-psutil
 Requires:       python3-py3nvml
@@ -23,12 +24,12 @@ Prometheus exporter for the stats in the cgroup accounting with slurm. This can 
 %setup -q -T -c -n %{name}-%{ref}
 cd %{_builddir}/%{name}-%{ref}
 tar xf %{_sourcedir}/%{name}-%{ref}.tar.gz --strip-components=1
+sed -i -e '1i#!/usr/libexec/platform-python' slurm-job-exporter.py
 
 %install
 mkdir -p %{buildroot}/%{_bindir}
 mkdir -p %{buildroot}/%{_unitdir}
 
-sed -i -e '1i#!/usr/libexec/platform-python' slurm-job-exporter.py
 install -m 0755 %{name}.py %{buildroot}/%{_bindir}/%{name}
 install -m 0744 get_gpus.sh %{buildroot}/%{_bindir}/get_gpus.sh
 install -m 0644 slurm-job-exporter.service %{buildroot}/%{_unitdir}/slurm-job-exporter.service
